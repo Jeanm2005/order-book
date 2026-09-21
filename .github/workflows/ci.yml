@@ -1,0 +1,36 @@
+name: CI
+
+# Phase 0/1 scope only: pure userspace order book + matching engine +
+# replay, no networking. AF_XDP/eBPF work (Phase 2) needs root/CAP_NET_ADMIN
+# and a real NIC/loopback path and cannot run in a hosted runner — see
+# CLAUDE.md and README.md roadmap.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.build_type }} (clang++)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure
