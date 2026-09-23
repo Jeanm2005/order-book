@@ -7,17 +7,24 @@ matter here are correctness and measured latency, not feature breadth.
 
 [![CI](https://github.com/Jeanm2005/order-book/actions/workflows/ci.yml/badge.svg)](https://github.com/Jeanm2005/order-book/actions/workflows/ci.yml)
 
-**Status:** Phase 0 (correctness) and Phase 1 (synthetic feed + replay) are
-done and covered by CI. AF_XDP ingestion, the signal layer, and latency
-benchmarking aren't built yet — see [Roadmap](#roadmap).
+**Status:** Phase 0 (correctness), Phase 1 (synthetic feed + replay), and
+Phase 2 (AF_XDP ingestion) are done. Phase 2 is opt-in (`-DENABLE_AF_XDP=ON`,
+default off — CI stays on Phase 0/1) and has been verified under real
+privileges on the WSL2 dev box: `scripts/xdp_loopback_test.sh` delivers a
+2000-message synthetic feed over a veth pair through a real `bind()`ed
+AF_XDP socket and produces an identical book state (fills, traded qty,
+best bid/ask, resting qty) to file-replay, with zero kernel-reported drops.
+The signal layer and latency benchmarking aren't built yet — see
+[Roadmap](#roadmap).
 
 ## What it does
 
 A single-process, single-symbol order book that:
 
-- Ingests order/cancel messages over a zero-copy AF_XDP socket path
-  (kernel-bypass networking), not the regular socket API. *(planned —
-  Phase 2, replay-only for now)*
+- Ingests order/cancel messages over an AF_XDP socket path (kernel-bypass
+  networking), not the regular socket API. *(Phase 2, opt-in build behind
+  `-DENABLE_AF_XDP=ON`, verified via loopback test under real privileges;
+  file-replay remains the default, CI-covered path)*
 - Maintains a price-time-priority limit order book with no allocation,
   no locks, and no virtual dispatch on the hot path.
 - Matches incoming orders against resting liquidity and emits fills.
@@ -58,13 +65,18 @@ NIC -> XDP/eBPF (kernel) -> AF_XDP zero-copy ring -> userspace poller
 | `include/order_book.hpp` | `OrderBook` — the matching engine, price-time priority |
 | `include/spsc_ring_buffer.hpp` | `SpscRingBuffer` — lock-free single-producer/consumer ring for the market-data publish path |
 | `include/feed_message.hpp`, `include/feed_replay.hpp` | synthetic feed wire format + replay engine |
-| `src/main.cpp` | CLI: generate a synthetic feed, replay it through the book |
+| `src/main.cpp` | CLI: generate/replay a synthetic feed, `record-size`, `xdp-listen` (opt-in build) |
+| `ebpf/xdp_redirect.c` | Phase 2: XDP program, redirects the feed's UDP port into an `XSKMAP` |
+| `include/xdp_socket.hpp`, `src/xdp_socket.cpp` | Phase 2: raw AF_XDP socket (UMEM/ring setup, RX poll loop) |
+| `include/xdp_listen_cmd.hpp`, `src/xdp_listen_cmd.cpp` | Phase 2: `xdp-listen` CLI command, wires `XdpSocket` RX frames into `apply_message()` |
+| `scripts/xdp_loopback_test.sh` | Phase 2: veth + socat loopback correctness test (manual, not CI) |
 
 The matching path (`order_book.hpp`, `price_level.hpp`, `memory_pool.hpp`,
-`spsc_ring_buffer.hpp`) runs under a few hard constraints: no heap
-allocation once the pools are sized at startup, no virtual dispatch,
-prices are fixed-point 64-bit ticks — never floating point — and every
-hot struct gets evaluated for 64-byte cache-line alignment.
+`spsc_ring_buffer.hpp`, and now `xdp_socket.hpp`'s RX poll loop) runs under
+a few hard constraints: no heap allocation once the pools/rings are sized
+at startup, no virtual dispatch, prices are fixed-point 64-bit ticks —
+never floating point — and every hot struct gets evaluated for 64-byte
+cache-line alignment.
 
 ## Design notes
 
@@ -115,14 +127,45 @@ determinism, via randomized property tests plus a few targeted regression
 tests. Never benchmark a Debug build — only Release numbers mean anything
 for latency.
 
+## AF_XDP ingestion (Phase 2, opt-in)
+
+Requires `libbpf-dev` and `clang` (for the eBPF object), and, to actually
+run, root/`CAP_NET_ADMIN` plus a real or loopback-capable (veth) NIC path —
+this only works on the WSL2/Linux dev box, not in CI or a sandboxed
+container. See `AGENTS.md` "AF_XDP / eBPF work".
+
+```bash
+cmake -B build-xdp -DCMAKE_BUILD_TYPE=Release -DENABLE_AF_XDP=ON -DCMAKE_CXX_COMPILER=clang++
+cmake --build build-xdp
+sudo ./scripts/xdp_loopback_test.sh   # veth + socat loopback correctness check
+```
+
+The loopback script generates a feed, replays it via the file path for an
+expected result, then re-delivers the same messages over a veth pair (one
+`FeedMessage` per UDP datagram, via `socat`) into `xdp-listen`, and prints
+both results for comparison. Verified passing under real privileges on the
+WSL2 dev box: identical fills/traded-qty/best-bid/best-ask/resting-qty,
+zero kernel-reported drops (`XDP_STATISTICS`).
+
+Two real bugs surfaced only by running this for real, not by compiling it:
+`bind()` returned a bare `EINVAL` until `XDP_UMEM_COMPLETION_RING`/
+`XDP_TX_RING` were registered (never mmap'd — this socket is still RX-only
+in *use*), even though the AF_XDP docs suggest an RX-only ring pair should
+be enough; and veth's native XDP mode wouldn't bind either, so the program
+attaches in forced generic/SKB mode, same as the kernel's own `xskxceiver`
+selftest does for veth-pair testing. Neither is discoverable by reading
+the code — see `include/xdp_socket.hpp` and `src/xdp_socket.cpp` for the
+detail.
+
 ## Roadmap
 
 - [x] **Phase 0 — correctness.** Order book core and matching engine,
       pure userspace, no networking.
 - [x] **Phase 1 — synthetic feed + replay.** Wire format, generator, and
       a replay engine that runs the same matching path a live feed will.
-- [ ] **Phase 2 — AF_XDP ingestion.** Wire the feed into a real (or
-      loopback) AF_XDP socket path.
+- [x] **Phase 2 — AF_XDP ingestion.** Wire the feed into a real (or
+      loopback) AF_XDP socket path. Opt-in build (`-DENABLE_AF_XDP=ON`);
+      loopback test passed under real privileges on the WSL2 dev box.
 - [ ] **Phase 3 — signal layer.** Microprice, order book imbalance at
       multiple depths.
 - [ ] **Phase 4 — latency measurement.** Swap the price-level container

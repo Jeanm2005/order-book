@@ -12,7 +12,7 @@ that matter; nothing else is the point of this project.
 - Release builds only for anything you benchmark — Debug numbers are meaningless here.
 - Compiler: clang++ preferred (better -march=native codegen visibility for this kind of code); note in the PR if you switch to g++ for a specific reason.
 
-## Hard rules for the hot path (order_book.hpp, price_level.hpp, memory_pool.hpp, spsc_ring_buffer.hpp)
+## Hard rules for the hot path (order_book.hpp, price_level.hpp, memory_pool.hpp, spsc_ring_buffer.hpp, xdp_socket.hpp)
 
 - No `malloc`/`new`/`std::vector::push_back` growth on any path an incoming order can take. Preallocate everything.
 - No `virtual` calls, no `std::function` with heap-allocating captures. Raw function pointers or templates only.

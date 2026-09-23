@@ -21,6 +21,46 @@ target_include_directories(order_book_engine INTERFACE include)
 add_executable(order_book_main src/main.cpp)
 target_link_libraries(order_book_main PRIVATE order_book_engine)
 
+# Phase 2 (AF_XDP ingestion), default OFF: the default configure/CI never
+# even probes for libbpf, so nothing about this option can affect the
+# Phase 0/1 build. Needs libbpf-dev + clang (for the eBPF object) and, at
+# runtime, CAP_NET_ADMIN/root and a real or loopback-capable NIC — see
+# AGENTS.md "AF_XDP / eBPF work".
+option(ENABLE_AF_XDP "Build the Phase 2 AF_XDP ingestion path" OFF)
+
+if(ENABLE_AF_XDP)
+    find_library(LIBBPF_LIBRARY NAMES bpf)
+    find_path(LIBBPF_INCLUDE_DIR NAMES bpf/libbpf.h)
+    if(NOT LIBBPF_LIBRARY OR NOT LIBBPF_INCLUDE_DIR)
+        message(FATAL_ERROR "ENABLE_AF_XDP requires libbpf-dev (bpf/libbpf.h / libbpf.so not found)")
+    endif()
+
+    find_program(CLANG_BPF NAMES clang)
+    if(NOT CLANG_BPF)
+        message(FATAL_ERROR "ENABLE_AF_XDP requires clang to compile ebpf/xdp_redirect.c")
+    endif()
+
+    # Kernel-side object: compiled with clang's BPF backend, not the host
+    # compiler. Same flags as this author's net-suite/ebpf-filter/Makefile.
+    set(XDP_BPF_OBJ ${CMAKE_BINARY_DIR}/xdp_redirect.o)
+    add_custom_command(
+        OUTPUT ${XDP_BPF_OBJ}
+        COMMAND ${CLANG_BPF} -O2 -g -target bpf
+                -I/usr/include -I/usr/include/x86_64-linux-gnu
+                -c ${CMAKE_SOURCE_DIR}/ebpf/xdp_redirect.c -o ${XDP_BPF_OBJ}
+        DEPENDS ${CMAKE_SOURCE_DIR}/ebpf/xdp_redirect.c
+        COMMENT "Compiling eBPF XDP redirect program -> ${XDP_BPF_OBJ}"
+        VERBATIM
+    )
+    add_custom_target(xdp_bpf_obj ALL DEPENDS ${XDP_BPF_OBJ})
+
+    target_sources(order_book_main PRIVATE src/xdp_socket.cpp src/xdp_listen_cmd.cpp)
+    target_include_directories(order_book_main PRIVATE ${LIBBPF_INCLUDE_DIR})
+    target_compile_definitions(order_book_main PRIVATE HAVE_AF_XDP XDP_BPF_OBJ_PATH="${XDP_BPF_OBJ}")
+    target_link_libraries(order_book_main PRIVATE ${LIBBPF_LIBRARY} elf)
+    add_dependencies(order_book_main xdp_bpf_obj)
+endif()
+
 enable_testing()
 
 add_executable(order_book_tests tests/order_book_tests.cpp)

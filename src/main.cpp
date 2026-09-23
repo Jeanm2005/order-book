@@ -8,6 +8,7 @@
 #include "feed_message.hpp"
 #include "feed_replay.hpp"
 #include "order_book.hpp"
+#include "xdp_listen_cmd.hpp"
 
 namespace {
 
@@ -96,12 +97,25 @@ int run_replay(const std::string& in_path) {
     return 0;
 }
 
+// Prints sizeof(FeedMessage)/sizeof(FeedFileHeader) so tooling (e.g.
+// scripts/xdp_loopback_test.sh, which has to slice a feed file into
+// per-record UDP datagrams) never has to hardcode struct sizes that could
+// silently drift out of sync with feed_message.hpp.
+int run_record_size() {
+    std::printf("%zu %zu\n", sizeof(FeedMessage), sizeof(FeedFileHeader));
+    return 0;
+}
+
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
         "usage:\n"
         "  %s generate <output.feed> <num_messages> [seed]\n"
-        "  %s replay <input.feed>\n",
-        argv0, argv0);
+        "  %s replay <input.feed>\n"
+        "  %s record-size\n",
+        argv0, argv0, argv0);
+#ifdef HAVE_AF_XDP
+    std::fprintf(stderr, "  %s xdp-listen <ifname> <queue_id> [bpf_obj_path]\n", argv0);
+#endif
 }
 
 } // namespace
@@ -122,6 +136,14 @@ int main(int argc, char** argv) {
     if (cmd == "replay" && argc >= 3) {
         return run_replay(argv[2]);
     }
+    if (cmd == "record-size") {
+        return run_record_size();
+    }
+#ifdef HAVE_AF_XDP
+    if (cmd == "xdp-listen") {
+        return run_xdp_listen(argc, argv);
+    }
+#endif
 
     print_usage(argv[0]);
     return 1;
