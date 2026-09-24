@@ -74,3 +74,11 @@ add_test(NAME feed_replay_tests COMMAND feed_replay_tests)
 add_executable(signal_tests tests/signal_tests.cpp)
 target_link_libraries(signal_tests PRIVATE order_book_engine)
 add_test(NAME signal_tests COMMAND signal_tests)
+
+add_executable(ladder_tests tests/ladder_tests.cpp)
+target_link_libraries(ladder_tests PRIVATE order_book_engine)
+add_test(NAME ladder_tests COMMAND ladder_tests)
+
+# A matching-loop bug tends to hang rather than fail (e.g. a stale best
+# level that never empties) — bound every suite so CI fails instead of stalling.
+set_tests_properties(order_book_tests feed_replay_tests signal_tests ladder_tests PROPERTIES TIMEOUT 120)

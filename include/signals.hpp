@@ -75,8 +75,10 @@ static_assert(sizeof(BookSignals) == 64, "BookSignals is meant to fill exactly o
 // Recomputes every signal from the current book state. O(kMaxSignalDepth)
 // level reads per side, no allocation — this is a tick-to-trade pipeline
 // stage (it runs after matching on each update), so hot-path rules apply.
-template <std::size_t Cap>
-inline void compute_signals(const OrderBook<Cap>& ob, BookSignals& out) {
+// Templated on the book type (not OrderBook<Cap>) so it works for any
+// window size and for the benchmark's MapOrderBook reference.
+template <typename Book>
+inline void compute_signals(const Book& ob, BookSignals& out) {
     static_assert([] {
         for (std::size_t i = 1; i < kNumImbalanceDepths; ++i)
             if (kImbalanceDepths[i] <= kImbalanceDepths[i - 1]) return false;

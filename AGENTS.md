@@ -12,7 +12,7 @@ that matter; nothing else is the point of this project.
 - Release builds only for anything you benchmark — Debug numbers are meaningless here.
 - Compiler: clang++ preferred (better -march=native codegen visibility for this kind of code); note in the PR if you switch to g++ for a specific reason.
 
-## Hard rules for the hot path (order_book.hpp, price_level.hpp, memory_pool.hpp, spsc_ring_buffer.hpp, xdp_socket.hpp, signals.hpp)
+## Hard rules for the hot path (order_book.hpp, price_level.hpp, memory_pool.hpp, spsc_ring_buffer.hpp, xdp_socket.hpp, signals.hpp, level_ladder.hpp)
 
 - No `malloc`/`new`/`std::vector::push_back` growth on any path an incoming order can take. Preallocate everything.
 - No `virtual` calls, no `std::function` with heap-allocating captures. Raw function pointers or templates only.
@@ -20,14 +20,15 @@ that matter; nothing else is the point of this project.
   Signals (`signals.hpp`) follow the same rule: fixed-point int64 scaled by `kSignalScale`.
 - Any new hot-path struct gets `alignas(64)` considered explicitly — say in the PR/commit message whether you added it and why, or why it wasn't needed.
 
-## Known placeholder (not a bug — don't "fix" silently)
+## Price-level container (Phase 4 swap done)
 
-`order_book.hpp` uses `std::map` for price levels right now. The intended
-production structure is a flat/sparse array over the hot range around
-best bid/ask, map fallback only for the long tail. Do NOT swap this without
-being asked to — get the invariant tests green on the map version first,
-then swap the container in a dedicated step and re-run the same tests
-unchanged to prove the swap didn't change behavior.
+Price levels are a `LevelLadder` (`level_ladder.hpp`): a flat bitmap-indexed
+window over the hot range, with a `std::map` fallback for the long tail.
+The swap was validated by the Phase 0-3 tests running unchanged, plus
+`tests/ladder_tests.cpp`, which diffs it against the old map book
+(`tests/support/map_order_book.hpp`) after every op. Any future change to
+the container follows the same rule: keep that reference and those tests
+unchanged, and make them pass.
 
 ## Testing before any latency claim
 

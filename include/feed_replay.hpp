@@ -8,8 +8,8 @@
 // Applies one feed message to the book. This is the exact function Phase 2's
 // AF_XDP RX path will call per-frame once that's wired up — keep it
 // allocation-free and branch-light, it's the only hot-path piece of Phase 1.
-template <std::size_t Cap>
-inline void apply_message(OrderBook<Cap>& ob, const FeedMessage& msg) {
+template <typename Book>
+inline void apply_message(Book& ob, const FeedMessage& msg) {
     switch (msg.type) {
         case MsgType::AddOrder:
             ob.add_order(msg.id, msg.side, msg.price, msg.qty, msg.ts);
@@ -63,8 +63,8 @@ inline bool load_feed_file(const std::string& path, std::vector<FeedMessage>& ou
 }
 
 // Replays every message in `msgs` into `ob` in order via apply_message().
-template <std::size_t Cap>
-inline void replay(OrderBook<Cap>& ob, const std::vector<FeedMessage>& msgs) {
+template <typename Book>
+inline void replay(Book& ob, const std::vector<FeedMessage>& msgs) {
     for (const auto& msg : msgs) {
         apply_message(ob, msg);
     }
