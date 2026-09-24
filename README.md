@@ -7,15 +7,14 @@ matter here are correctness and measured latency, not feature breadth.
 
 [![CI](https://github.com/Jeanm2005/order-book/actions/workflows/ci.yml/badge.svg)](https://github.com/Jeanm2005/order-book/actions/workflows/ci.yml)
 
-**Status:** Phase 0 (correctness), Phase 1 (synthetic feed + replay), and
-Phase 2 (AF_XDP ingestion) are done. Phase 2 is opt-in (`-DENABLE_AF_XDP=ON`,
+**Status:** Phase 0 (correctness), Phase 1 (synthetic feed + replay),
+Phase 2 (AF_XDP ingestion), and Phase 3 (signal layer) are done. Phase 2 is opt-in (`-DENABLE_AF_XDP=ON`,
 default off — CI stays on Phase 0/1) and has been verified under real
 privileges on the WSL2 dev box: `scripts/xdp_loopback_test.sh` delivers a
 2000-message synthetic feed over a veth pair through a real `bind()`ed
 AF_XDP socket and produces an identical book state (fills, traded qty,
 best bid/ask, resting qty) to file-replay, with zero kernel-reported drops.
-The signal layer and latency benchmarking aren't built yet — see
-[Roadmap](#roadmap).
+Latency benchmarking isn't built yet — see [Roadmap](#roadmap).
 
 ## What it does
 
@@ -29,7 +28,8 @@ A single-process, single-symbol order book that:
   no locks, and no virtual dispatch on the hot path.
 - Matches incoming orders against resting liquidity and emits fills.
 - Computes real-time market-microstructure signals (microprice, order
-  book imbalance) on top of the book state. *(planned — Phase 3)*
+  book imbalance at depths 1/3/5) on top of the book state, in
+  fixed-point integer arithmetic. *(Phase 3 — see [Signals](#signals))*
 - Measures its own tick-to-trade latency end-to-end via a histogram,
   reporting p50/p99/p99.9/p99.99 — tail latency is what actually gets
   cared about, not the average. *(planned — Phase 4)*
@@ -65,6 +65,7 @@ NIC -> XDP/eBPF (kernel) -> AF_XDP zero-copy ring -> userspace poller
 | `include/order_book.hpp` | `OrderBook` — the matching engine, price-time priority |
 | `include/spsc_ring_buffer.hpp` | `SpscRingBuffer` — lock-free single-producer/consumer ring for the market-data publish path |
 | `include/feed_message.hpp`, `include/feed_replay.hpp` | synthetic feed wire format + replay engine |
+| `include/signals.hpp` | Phase 3: `BookSignals` + `compute_signals()` — microprice, order book imbalance at multiple depths |
 | `src/main.cpp` | CLI: generate/replay a synthetic feed, `record-size`, `xdp-listen` (opt-in build) |
 | `ebpf/xdp_redirect.c` | Phase 2: XDP program, redirects the feed's UDP port into an `XSKMAP` |
 | `include/xdp_socket.hpp`, `src/xdp_socket.cpp` | Phase 2: raw AF_XDP socket (UMEM/ring setup, RX poll loop) |
@@ -72,7 +73,8 @@ NIC -> XDP/eBPF (kernel) -> AF_XDP zero-copy ring -> userspace poller
 | `scripts/xdp_loopback_test.sh` | Phase 2: veth + socat loopback correctness test (manual, not CI) |
 
 The matching path (`order_book.hpp`, `price_level.hpp`, `memory_pool.hpp`,
-`spsc_ring_buffer.hpp`, and now `xdp_socket.hpp`'s RX poll loop) runs under
+`spsc_ring_buffer.hpp`, `xdp_socket.hpp`'s RX poll loop, and
+`signals.hpp`'s `compute_signals()`) runs under
 a few hard constraints: no heap allocation once the pools/rings are sized
 at startup, no virtual dispatch, prices are fixed-point 64-bit ticks —
 never floating point — and every hot struct gets evaluated for 64-byte
@@ -94,6 +96,41 @@ best bid/ask, with the map as a fallback for the long tail. The swap is
 deliberately deferred to its own step in Phase 4, validated against the
 existing test suite unchanged, instead of getting bundled into feature
 work before the matching logic itself was proven correct.
+
+## Signals
+
+`include/signals.hpp` computes read-only analytics from the book after each
+update; nothing here feeds back into matching. Every value is a fixed-point
+`int64` in units of 1e-6 (of a tick for prices, of the unit interval for
+imbalance). The no-floating-point rule applies here too, since this is a
+tick-to-trade pipeline stage. Intermediates are `__int128`, so the only
+range limit is |price| < ~9.2e12 ticks.
+
+- **Microprice**: size-weighted top-of-book mid,
+  `(Pb·Qa + Pa·Qb) / (Qa + Qb)`. Heavier bid size pulls it toward the ask.
+  This is the model-free version commonly called microprice, not Stoikov's
+  (2018) adjusted microprice, which needs a fitted model of queue dynamics.
+  Floored, so it's deterministic for any price sign.
+- **Order book imbalance** at depths 1, 3, 5 (price levels per side):
+  `(Qb − Qa) / (Qb + Qa)` over the cumulative qty of the best N levels, in
+  [−1, 1]. Truncates toward zero, so swapping sides negates it exactly.
+  A one-sided book gives ±1; an empty book gives 0.
+
+`BookSignals` is `alignas(64)` and exactly 64 bytes (static-asserted), so
+one snapshot is one cache line. That's the intended slot size for the
+SPSC publish ring. To fit, it has no separate valid flag: a side is empty
+iff its best-level qty is 0 (the book never keeps an empty level).
+
+The signal layer reads the book only through `OrderBook::top_levels()`,
+a read-only L2 depth view. Phase 4's container swap has to preserve it,
+and `tests/signal_tests.cpp` is part of the suite that swap is validated
+against. Those tests check the formulas against hand-computed values.
+They also check that, after every operation of randomized flow, the
+book's signals exactly equal signals derived from an independently
+tracked model of resting orders. On top of that, a mirrored book (sides
+swapped, prices negated) fed the same flow must produce mirrored signals
+and an identical fill sequence, which also verifies that the matching
+engine is side-symmetric.
 
 ## Getting started
 
@@ -122,8 +159,8 @@ ctest --test-dir build-debug --output-on-failure
 ```
 
 Debug builds run under ASan/UBSan. The suite covers quantity
-conservation, price-time priority, no phantom/over-fills, and replay
-determinism, via randomized property tests plus a few targeted regression
+conservation, price-time priority, no phantom/over-fills, replay
+determinism, matching-engine side symmetry, and signal correctness, via randomized property tests plus a few targeted regression
 tests. Never benchmark a Debug build — only Release numbers mean anything
 for latency.
 
@@ -166,8 +203,8 @@ detail.
 - [x] **Phase 2 — AF_XDP ingestion.** Wire the feed into a real (or
       loopback) AF_XDP socket path. Opt-in build (`-DENABLE_AF_XDP=ON`);
       loopback test passed under real privileges on the WSL2 dev box.
-- [ ] **Phase 3 — signal layer.** Microprice, order book imbalance at
-      multiple depths.
+- [x] **Phase 3 — signal layer.** Microprice, order book imbalance at
+      depths 1/3/5, fixed-point, one cache line per snapshot.
 - [ ] **Phase 4 — latency measurement.** Swap the price-level container
       for the flat/sparse array, instrument the pipeline, report
       p50/p99/p99.9/p99.99 off a Release build.

@@ -70,3 +70,7 @@ add_test(NAME order_book_tests COMMAND order_book_tests)
 add_executable(feed_replay_tests tests/feed_replay_tests.cpp)
 target_link_libraries(feed_replay_tests PRIVATE order_book_engine)
 add_test(NAME feed_replay_tests COMMAND feed_replay_tests)
+
+add_executable(signal_tests tests/signal_tests.cpp)
+target_link_libraries(signal_tests PRIVATE order_book_engine)
+add_test(NAME signal_tests COMMAND signal_tests)

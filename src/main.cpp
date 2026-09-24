@@ -8,6 +8,7 @@
 #include "feed_message.hpp"
 #include "feed_replay.hpp"
 #include "order_book.hpp"
+#include "signals.hpp"
 #include "xdp_listen_cmd.hpp"
 
 namespace {
@@ -94,6 +95,10 @@ int run_replay(const std::string& in_path) {
     if (ob.best_ask(ba)) std::printf("best ask: %lld\n", static_cast<long long>(ba));
     else std::printf("best ask: (none)\n");
     std::printf("resting qty: %lld\n", static_cast<long long>(ob.total_resting_qty()));
+
+    BookSignals signals;
+    compute_signals(ob, signals);
+    print_signals(signals);
     return 0;
 }
 

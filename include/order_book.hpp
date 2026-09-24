@@ -14,6 +14,12 @@ struct Fill {
     Quantity qty;
 };
 
+// One aggregated price level as seen from outside the book (L2 view).
+struct LevelQty {
+    Price    price;
+    Quantity qty; // always > 0: empty levels are erased, never left resting
+};
+
 template <std::size_t PoolCapacity = 1 << 16>
 class OrderBook {
 public:
@@ -66,6 +72,15 @@ public:
         return true;
     }
 
+    // Copies up to `max_levels` of the best price levels on `side` (best
+    // first) into caller-owned `out`, returns how many were written. Read-
+    // only, no allocation — this is the signal layer's (Phase 3) view into
+    // depth. Part of the contract the Phase 4 container swap must preserve.
+    std::size_t top_levels(Side side, LevelQty* out, std::size_t max_levels) const {
+        return side == Side::Buy ? copy_top(bids_, out, max_levels)
+                                 : copy_top(asks_, out, max_levels);
+    }
+
     // Diagnostic only — walks every price level. Not on the hot path;
     // for tests/tooling, never call this from a path an incoming order takes.
     Quantity total_resting_qty() const {
@@ -76,6 +91,15 @@ public:
     }
 
 private:
+    template <typename Levels>
+    static std::size_t copy_top(const Levels& levels, LevelQty* out, std::size_t max_levels) {
+        std::size_t n = 0;
+        for (auto it = levels.begin(); it != levels.end() && n < max_levels; ++it, ++n) {
+            out[n] = LevelQty{it->first, it->second.total_qty};
+        }
+        return n;
+    }
+
     template <typename Levels>
     static bool remove_from_book(Levels& levels, Order* o) {
         auto it = levels.find(o->price);
