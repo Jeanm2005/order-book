@@ -14,7 +14,9 @@ privileges on the WSL2 dev box: `scripts/xdp_loopback_test.sh` delivers a
 2000-message synthetic feed over a veth pair through a real `bind()`ed
 AF_XDP socket and produces an identical book state (fills, traded qty,
 best bid/ask, resting qty) to file-replay, with zero kernel-reported drops.
-Latency benchmarking isn't built yet — see [Roadmap](#roadmap).
+Phase 4 (flat-array price levels + latency measurement) is done: book +
+signals run at 97 ns p50 / 429 ns p99.9 per message on the dev box — see
+[Latency](#latency-phase-4).
 
 ## What it does
 
@@ -32,7 +34,8 @@ A single-process, single-symbol order book that:
   fixed-point integer arithmetic. *(Phase 3 — see [Signals](#signals))*
 - Measures its own tick-to-trade latency end-to-end via a histogram,
   reporting p50/p99/p99.9/p99.99 — tail latency is what actually gets
-  cared about, not the average. *(planned — Phase 4)*
+  cared about, not the average. *(Phase 4 — `order_book_bench`, see
+  [Latency](#latency-phase-4))*
 
 ## Non-goals
 
@@ -66,6 +69,10 @@ NIC -> XDP/eBPF (kernel) -> AF_XDP zero-copy ring -> userspace poller
 | `include/spsc_ring_buffer.hpp` | `SpscRingBuffer` — lock-free single-producer/consumer ring for the market-data publish path |
 | `include/feed_message.hpp`, `include/feed_replay.hpp` | synthetic feed wire format + replay engine |
 | `include/signals.hpp` | Phase 3: `BookSignals` + `compute_signals()` — microprice, order book imbalance at multiple depths |
+| `include/level_ladder.hpp` | Phase 4: `LevelLadder` — one side's price levels: flat bitmap-indexed window over the hot range, `std::map` tail |
+| `include/latency_histogram.hpp`, `include/tsc_clock.hpp` | Phase 4: fixed-size HDR-style histogram, fenced/calibrated RDTSC stamps |
+| `bench/latency_bench.cpp` | Phase 4: `order_book_bench` — per-stage latency histograms over a replayed feed |
+| `tests/support/map_order_book.hpp` | Phase 4: the pre-swap `std::map` book, kept as test oracle and bench baseline |
 | `src/main.cpp` | CLI: generate/replay a synthetic feed, `record-size`, `xdp-listen` (opt-in build) |
 | `ebpf/xdp_redirect.c` | Phase 2: XDP program, redirects the feed's UDP port into an `XSKMAP` |
 | `include/xdp_socket.hpp`, `src/xdp_socket.cpp` | Phase 2: raw AF_XDP socket (UMEM/ring setup, RX poll loop) |
@@ -89,13 +96,25 @@ delivery into userspace while the NIC stays under normal kernel control,
 and it extends directly from prior XDP/eBPF work rather than starting a
 new networking stack from scratch.
 
-**`std::map` price levels, for now.** The order book currently keys price
-levels with `std::map`. That's a known placeholder, not an oversight —
-the intended structure is a flat/sparse array over the hot range around
-best bid/ask, with the map as a fallback for the long tail. The swap is
-deliberately deferred to its own step in Phase 4, validated against the
-existing test suite unchanged, instead of getting bundled into feature
-work before the matching logic itself was proven correct.
+**Flat hot window, `std::map` tail.** Each side's price levels live in a
+`LevelLadder`: a flat array of 1024 consecutive ticks (32 KB per side)
+plus an occupancy bitmap, so finding the next best level is a `clz`/`ctz`
+scan over 64-bit words instead of a tree walk. Prices outside the window
+go to a `std::map` tail. The window follows the top of book: an insert
+beyond the window's better edge re-centers it, and levels that fall out
+move to the tail. Inserts on the worse side just join the tail. Each
+price lives in exactly one place. Only the tail and re-centers can
+allocate. Phases 0–3 shipped on a plain `std::map`, and the swap came
+later as its own step: the Phase 0–3 test suites passed against the new
+container with the test code unchanged. `tests/ladder_tests.cpp` then
+runs a 64-tick window against the old map book (kept as
+`tests/support/map_order_book.hpp`) in lock-step on drifting, jumping
+flows, and compares fills, full depth, best bid/ask, and signals after
+every operation. Those flows force the tail, re-center, and migration
+paths, which the default window never reaches with the 90–110 test
+prices. `PriceLevel` is not `alignas(64)`: at 32 bytes, adjacent levels
+share a line, which helps the depth scan, and the book has a single
+writer, so there's no false sharing to prevent.
 
 ## Signals
 
@@ -122,15 +141,105 @@ SPSC publish ring. To fit, it has no separate valid flag: a side is empty
 iff its best-level qty is 0 (the book never keeps an empty level).
 
 The signal layer reads the book only through `OrderBook::top_levels()`,
-a read-only L2 depth view. Phase 4's container swap has to preserve it,
-and `tests/signal_tests.cpp` is part of the suite that swap is validated
-against. Those tests check the formulas against hand-computed values.
+a read-only L2 depth view. The Phase 4 container swap preserved it, and
+`tests/signal_tests.cpp` was part of the unchanged suite that swap was
+validated against. Those tests check the formulas against hand-computed values.
 They also check that, after every operation of randomized flow, the
 book's signals exactly equal signals derived from an independently
 tracked model of resting orders. On top of that, a mirrored book (sides
 swapped, prices negated) fed the same flow must produce mirrored signals
 and an identical fill sequence, which also verifies that the matching
 engine is side-symmetric.
+
+## Latency (Phase 4)
+
+`order_book_bench` replays a feed from memory and stamps every message
+around each pipeline stage:
+
+| stage | what's inside the stamps |
+|---|---|
+| `add` / `cancel` | `apply_message()`: match + rest, or cancel |
+| `signals` | `compute_signals()` on the updated book |
+| `total` | message in hand → signals out |
+| `overhead` | two back-to-back stamps: the measurement floor, reported rather than subtracted |
+
+- **Stamps:** fenced RDTSC (`lfence; rdtsc; lfence` to open,
+  `rdtscp; lfence` to close), calibrated against `CLOCK_MONOTONIC`.
+- **Histogram:** a fixed-size, integer-only HDR-style histogram. Values
+  are exact below 256 ticks and within 1/128 above that, and each
+  quantile is reported as its bucket's upper bound, so a reported p99.9
+  is never lower than the true one.
+- **Warm-up:** a warm-up pass runs on a throwaway book first. The timed
+  pass then uses a fresh book, so it replays the identical state sequence.
+- **Baseline:** `--book map` runs the pre-swap `std::map` book on the
+  same feed as the before/after baseline.
+- **Not measured:** NIC → userspace (AF_XDP RX) and market-data publish.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
+cmake --build build
+./build/order_book_main generate wide.feed 400000 42 wide   # ~hundreds of live levels, drifting mid
+./build/order_book_bench wide.feed --cpu 2                  # flat ladder
+./build/order_book_bench wide.feed --cpu 2 --book map       # pre-swap baseline
+```
+
+There are two feed profiles:
+- **`narrow`** (the default): 11 price levels, 95–105. This is the map's
+  best case, because an 11-node tree stays in L1.
+- **`wide`**: the mid drifts, and orders rest up to 300 ticks from it,
+  mostly near the touch.
+
+### Results
+
+WSL2 dev box, Release, clang++ 21, `-O3 -march=native`, pinned to CPU 2
+(`--cpu 2`, not an isolated core). Feed: `wide`, 400,000 messages,
+seed 42. Stamp clock: invariant TSC at 3686 MHz. All values in ns.
+Single run per book.
+
+**Flat ladder (current):**
+
+| stage | count | min | p50 | p99 | p99.9 | p99.99 | max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| add | 219,727 | 22 | 50 | 196 | 333 | 807 | 23,153 |
+| cancel | 180,273 | 20 | 47 | 205 | 342 | 540 | 13,357 |
+| signals | 400,000 | 42 | 47 | 101 | 114 | 253 | 78,275 |
+| **total** | 400,000 | 68 | **97** | **270** | **429** | 5,520 | 78,324 |
+| overhead | 1,000,000 | 13 | 14 | 15 | 16 | 16 | 10,438 |
+
+**`std::map` book (pre-Phase-4 baseline), same feed:**
+
+| stage | count | min | p50 | p99 | p99.9 | p99.99 | max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| add | 219,727 | 22 | 64 | 209 | 405 | 1,267 | 34,934 |
+| cancel | 180,273 | 23 | 70 | 242 | 444 | 1,206 | 127,505 |
+| signals | 400,000 | 33 | 37 | 100 | 165 | 344 | 43,736 |
+| **total** | 400,000 | 60 | **109** | **323** | **540** | 8,680 | 129,334 |
+| overhead | 1,000,000 | 13 | 15 | 16 | 17 | 17 | 42,475 |
+
+What the numbers say:
+
+- **The swap pays off where it should.** Median add is 22% faster
+  (50 vs 64 ns) and median cancel 33% faster (47 vs 70 ns). Tails
+  improve too: add p99.9 is 333 vs 405 ns and cancel p99.9 is 342 vs
+  444 ns. Both books produce identical fills (27,259).
+- **End to end, p99.9 is 429 ns vs 540 ns.** That covers book +
+  signals per message, and it's under the project's sub-µs p99.9
+  target for this part of the pipeline. It is *not* full
+  tick-to-trade: NIC → userspace isn't in it.
+- **The ladder is slower at the signals median:** 47 vs 37 ns.
+  Walking the top 5 levels by bitmap scan costs more than 5 in-order
+  steps through a small, cache-hot tree. It has the better tail
+  (p99.9 114 vs 165 ns). This is the obvious next target: e.g.,
+  maintain depth aggregates incrementally instead of re-walking.
+- **Treat p99.99 and max as environment, not code, until shown
+  otherwise.** The book work is the same at p99.9 and p99.99, yet
+  total jumps from 429 ns to 5.5 µs, and the max reaches 78 µs. That
+  pattern fits interrupts, VM exits, or scheduler preemption on a
+  non-isolated core under WSL2's hypervisor. I haven't verified that
+  (it needs `perf` / an isolated core on bare Linux). At this count,
+  p99.99 also rests on only ~20–40 samples per stage.
+- The timing overhead (14 ns p50 for two back-to-back stamps) is
+  included in every row, not subtracted.
 
 ## Getting started
 
@@ -160,7 +269,8 @@ ctest --test-dir build-debug --output-on-failure
 
 Debug builds run under ASan/UBSan. The suite covers quantity
 conservation, price-time priority, no phantom/over-fills, replay
-determinism, matching-engine side symmetry, and signal correctness, via randomized property tests plus a few targeted regression
+determinism, matching-engine side symmetry, signal correctness,
+ladder-vs-map equivalence, and latency-histogram accuracy, via randomized property tests plus a few targeted regression
 tests. Never benchmark a Debug build — only Release numbers mean anything
 for latency.
 
@@ -205,8 +315,9 @@ detail.
       loopback test passed under real privileges on the WSL2 dev box.
 - [x] **Phase 3 — signal layer.** Microprice, order book imbalance at
       depths 1/3/5, fixed-point, one cache line per snapshot.
-- [ ] **Phase 4 — latency measurement.** Swap the price-level container
-      for the flat/sparse array, instrument the pipeline, report
-      p50/p99/p99.9/p99.99 off a Release build.
+- [x] **Phase 4 — latency measurement.** Flat bitmap-indexed price
+      levels (differential-tested against the map book), per-stage
+      HDR-style histograms, pinned Release numbers from the dev box:
+      97 ns p50 / 429 ns p99.9 per message, book + signals.
 - [ ] **Phase 5 — writeup.** The latency numbers, the design tradeoffs,
       and the why behind each decision.

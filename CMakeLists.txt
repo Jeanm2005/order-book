@@ -79,6 +79,18 @@ add_executable(ladder_tests tests/ladder_tests.cpp)
 target_link_libraries(ladder_tests PRIVATE order_book_engine)
 add_test(NAME ladder_tests COMMAND ladder_tests)
 
+add_executable(histogram_tests tests/histogram_tests.cpp)
+target_link_libraries(histogram_tests PRIVATE order_book_engine)
+add_test(NAME histogram_tests COMMAND histogram_tests)
+
+# Phase 4 latency benchmark. Not a test: builds in every config (so CI keeps
+# it compiling), but only a Release run on the dev box produces numbers —
+# see AGENTS.md "Testing before any latency claim". Includes tests/ for the
+# pre-swap MapOrderBook reference (--book map).
+add_executable(order_book_bench bench/latency_bench.cpp)
+target_link_libraries(order_book_bench PRIVATE order_book_engine)
+target_include_directories(order_book_bench PRIVATE tests)
+
 # A matching-loop bug tends to hang rather than fail (e.g. a stale best
 # level that never empties) — bound every suite so CI fails instead of stalling.
-set_tests_properties(order_book_tests feed_replay_tests signal_tests ladder_tests PROPERTIES TIMEOUT 120)
+set_tests_properties(order_book_tests feed_replay_tests signal_tests ladder_tests histogram_tests PROPERTIES TIMEOUT 120)

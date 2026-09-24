@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,51 @@ std::vector<FeedMessage> generate_feed(std::uint64_t seed, std::size_t num_messa
     return msgs;
 }
 
+// Wider, more book-like flow for benchmarking the price-level container
+// (Phase 4): the mid drifts, and resting orders spread up to `depth` ticks
+// from it with most of them near the touch (min of two uniforms), so the
+// book holds hundreds of live levels instead of the narrow profile's 11.
+// Cancels only target ids still believed live, so most of them hit.
+std::vector<FeedMessage> generate_wide_feed(std::uint64_t seed, std::size_t num_messages, int depth = 300) {
+    std::vector<FeedMessage> msgs;
+    msgs.reserve(num_messages);
+
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int> pct(0, 99);
+    std::uniform_int_distribution<int> drift(-1, 1);
+    std::uniform_int_distribution<int> offset(0, depth);
+    std::uniform_int_distribution<int> qty_dist(1, 20);
+
+    std::vector<OrderId> live;
+    OrderId next_id = 1;
+    Price mid = 100'000;
+
+    for (std::size_t i = 0; i < num_messages; ++i) {
+        FeedMessage msg{};
+        msg.ts = static_cast<Nanos>(i);
+        if (pct(rng) < 10) mid += drift(rng);
+
+        if (live.empty() || pct(rng) < 55) {
+            msg.type = MsgType::AddOrder;
+            msg.id = next_id++;
+            msg.side = pct(rng) < 50 ? Side::Buy : Side::Sell;
+            int off = std::min(offset(rng), offset(rng));
+            msg.price = msg.side == Side::Buy ? mid - off : mid + 1 + off;
+            msg.qty = static_cast<Quantity>(qty_dist(rng));
+            live.push_back(msg.id);
+        } else {
+            std::uniform_int_distribution<std::size_t> pick(0, live.size() - 1);
+            std::size_t k = pick(rng);
+            msg.type = MsgType::CancelOrder;
+            msg.id = live[k];
+            live[k] = live.back();
+            live.pop_back();
+        }
+        msgs.push_back(msg);
+    }
+    return msgs;
+}
+
 // Fill accounting for the replay report. Raw function pointer target
 // (OrderBook::FillHandler allows no captures), so state lives in globals —
 // fine for a single-threaded CLI driver.
@@ -64,14 +110,14 @@ void report_fill(const Fill& f) {
     g_traded_qty += f.qty;
 }
 
-int run_generate(const std::string& out_path, std::size_t count, std::uint64_t seed) {
-    std::vector<FeedMessage> msgs = generate_feed(seed, count);
+int run_generate(const std::string& out_path, std::size_t count, std::uint64_t seed, bool wide) {
+    std::vector<FeedMessage> msgs = wide ? generate_wide_feed(seed, count) : generate_feed(seed, count);
     if (!save_feed_file(out_path, msgs)) {
         std::fprintf(stderr, "failed to write feed file: %s\n", out_path.c_str());
         return 1;
     }
-    std::printf("generated %zu messages (seed=%llu) -> %s\n",
-                msgs.size(), static_cast<unsigned long long>(seed), out_path.c_str());
+    std::printf("generated %zu messages (seed=%llu, profile=%s) -> %s\n",
+                msgs.size(), static_cast<unsigned long long>(seed), wide ? "wide" : "narrow", out_path.c_str());
     return 0;
 }
 
@@ -114,7 +160,7 @@ int run_record_size() {
 void print_usage(const char* argv0) {
     std::fprintf(stderr,
         "usage:\n"
-        "  %s generate <output.feed> <num_messages> [seed]\n"
+        "  %s generate <output.feed> <num_messages> [seed] [narrow|wide]\n"
         "  %s replay <input.feed>\n"
         "  %s record-size\n",
         argv0, argv0, argv0);
@@ -136,7 +182,12 @@ int main(int argc, char** argv) {
         std::string out_path = argv[2];
         std::size_t count = static_cast<std::size_t>(std::strtoull(argv[3], nullptr, 10));
         std::uint64_t seed = argc >= 5 ? std::strtoull(argv[4], nullptr, 10) : 42;
-        return run_generate(out_path, count, seed);
+        bool wide = argc >= 6 && std::string(argv[5]) == "wide";
+        if (argc >= 6 && !wide && std::string(argv[5]) != "narrow") {
+            print_usage(argv[0]);
+            return 1;
+        }
+        return run_generate(out_path, count, seed, wide);
     }
     if (cmd == "replay" && argc >= 3) {
         return run_replay(argv[2]);
