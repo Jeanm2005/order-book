@@ -1,16 +1,23 @@
 #include "xdp_listen_cmd.hpp"
 
 #ifdef HAVE_AF_XDP
+#include <atomic>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <thread>
 
 #include "feed_message.hpp"
 #include "feed_replay.hpp"
+#include "latency_histogram.hpp"
+#include "latency_report.hpp"
+#include "md_publisher.hpp"
 #include "order_book.hpp"
 #include "signals.hpp"
+#include "tsc_clock.hpp"
 #include "xdp_socket.hpp"
 
 namespace {
@@ -22,6 +29,17 @@ namespace {
 // synthetic/host-native by design (see feed_message.hpp) — a real wire
 // protocol would need a real parser instead of this fixed offset.
 constexpr std::size_t kHeaderBytes = 14 + 20 + 8;
+
+constexpr std::size_t kMdRing = 1 << 12;
+using Publisher = MdPublisher<kMdRing>;
+
+bool same_signals(const BookSignals& a, const BookSignals& b) {
+    if (a.best_bid != b.best_bid || a.best_ask != b.best_ask || a.bid_qty != b.bid_qty ||
+        a.ask_qty != b.ask_qty || a.microprice != b.microprice) return false;
+    for (std::size_t d = 0; d < kNumImbalanceDepths; ++d)
+        if (a.imbalance[d] != b.imbalance[d]) return false;
+    return true;
+}
 
 volatile std::sig_atomic_t g_stop = 0;
 void on_signal(int) { g_stop = 1; }
@@ -61,11 +79,45 @@ int run_xdp_listen(int argc, char** argv) {
 
     OrderBook<1 << 16> ob(&report_fill);
 
+    // Market-data consumer: drains every published snapshot on its own
+    // thread and keeps the last one, so shutdown can check it against the
+    // book. Setup-time allocation (thread, publisher) is fine here.
+    auto pub = std::make_unique<Publisher>();
+    std::atomic<bool> md_stop{false};
+    std::uint64_t md_received = 0;
+    BookSignals md_last;
+    std::thread md_consumer([&] {
+        BookSignals s;
+        for (;;) {
+            if (pub->poll(s)) {
+                ++md_received;
+                md_last = s;
+            } else if (md_stop.load(std::memory_order_acquire)) {
+                while (pub->poll(s)) { ++md_received; md_last = s; }
+                return;
+            }
+        }
+    });
+
+    // Per-frame latency, userspace view (no NIC hardware timestamps):
+    //   rx->pub  from the moment poll() starts draining the batch this frame
+    //            arrived in, to this frame's snapshot being published. Frames
+    //            later in a batch include the time spent on earlier ones,
+    //            which is real queueing delay.
+    //   frame    this frame alone: parse + book + signals + publish.
+    auto lat_rx = std::make_unique<LatencyHistogram>();
+    auto lat_frame = std::make_unique<LatencyHistogram>();
+    StampCalibration cal = calibrate_stamps();
+
     std::printf("xdp-listen: bound to %s queue %u (bpf obj: %s), ctrl+C to stop\n",
                 ifname.c_str(), queue_id, bpf_obj_path.c_str());
 
+    BookSignals sig;
     while (!g_stop) {
-        xsk.poll([&ob](const std::byte* data, std::uint32_t len) {
+        std::uint64_t batch_start = 0;
+        xsk.poll([&](const std::byte* data, std::uint32_t len) {
+            std::uint64_t t0 = stamp_begin();
+            if (batch_start == 0) batch_start = t0;
             if (len < kHeaderBytes + sizeof(FeedMessage)) return; // truncated/malformed frame
             FeedMessage msg;
             // memcpy, not reinterpret_cast-and-dereference: the payload
@@ -78,8 +130,15 @@ int run_xdp_listen(int argc, char** argv) {
             // not a libc call — no allocation, still hot-path-clean.
             std::memcpy(&msg, data + kHeaderBytes, sizeof(msg));
             apply_message(ob, msg);
+            compute_signals(ob, sig);
+            pub->publish(sig);
+            std::uint64_t t1 = stamp_end();
+            lat_rx->record(t1 - batch_start);
+            lat_frame->record(t1 - t0);
         });
     }
+    md_stop.store(true, std::memory_order_release);
+    md_consumer.join();
 
     std::printf("fills: %llu, traded qty: %lld\n",
                 static_cast<unsigned long long>(g_fill_count), static_cast<long long>(g_traded_qty));
@@ -115,6 +174,17 @@ int run_xdp_listen(int argc, char** argv) {
                     static_cast<unsigned long long>(stats.tx_invalid_descs),
                     static_cast<unsigned long long>(stats.tx_ring_empty_descs));
     }
+
+    // Not compared by the loopback script: counts and timings, not book state.
+    std::printf("md: published=%llu dropped=%llu consumer_received=%llu last_snapshot_matches_book=%s\n",
+                static_cast<unsigned long long>(pub->published()),
+                static_cast<unsigned long long>(pub->dropped()),
+                static_cast<unsigned long long>(md_received),
+                pub->published() == 0 ? "n/a" : (same_signals(md_last, signals) ? "yes" : "no"));
+    std::printf("latency on this machine (stamp clock %llu MHz):\n", static_cast<unsigned long long>(cal.mhz()));
+    print_latency_header();
+    print_latency_row("rx->pub", *lat_rx, cal);
+    print_latency_row("frame", *lat_frame, cal);
 
     xsk.close();
     return 0;

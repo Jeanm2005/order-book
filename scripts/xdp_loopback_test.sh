@@ -129,5 +129,30 @@ tail -c +"$((HEADER_BYTES + 1))" "$FEED_FILE" \
     | ip netns exec "$NS" socat -u -b "$RECORD_BYTES" - UDP-SENDTO:"$IP_A":$UDP_PORT
 
 sleep 1
-echo "[*] done injecting — xdp-listen output follows (via cleanup), compare against the expected block above"
-echo "    (fills/traded-qty/best-bid/best-ask/resting-qty should match exactly)"
+echo "[*] done injecting — stopping xdp-listen"
+kill -INT "$LISTEN_PID" 2>/dev/null || true
+wait "$LISTEN_PID"
+LISTEN_PID=""   # already reaped; cleanup() must not wait on it again
+
+# Pass/fail, not by eye: every book-state line (fills, traded qty, best
+# bid/ask, resting qty, refusals, signals) must match file replay exactly,
+# the kernel must report zero drops, and every published market-data
+# snapshot must have reached the consumer.
+BOOK_LINES='^(fills|best bid|best ask|resting qty|rejected|mid|microprice|imbalance@)'
+FAILED=0
+if ! diff <(echo "$EXPECTED" | grep -E "$BOOK_LINES") <(grep -E "$BOOK_LINES" "$LISTEN_OUT"); then
+    echo "[FAIL] book state from AF_XDP differs from file replay (diff above: < replay, > xdp-listen)"
+    FAILED=1
+fi
+if ! grep -qE '^xdp stats: rx_dropped=0 rx_invalid_descs=0 rx_ring_full=0 rx_fill_ring_empty_descs=0 ' "$LISTEN_OUT"; then
+    echo "[FAIL] kernel reported AF_XDP drops (see xdp stats line)"
+    FAILED=1
+fi
+if ! grep -qE "^md: published=$NUM_MESSAGES dropped=0 consumer_received=$NUM_MESSAGES last_snapshot_matches_book=yes" "$LISTEN_OUT"; then
+    echo "[FAIL] market-data publish: not every snapshot reached the consumer (see md line)"
+    FAILED=1
+fi
+if [[ "$FAILED" -eq 0 ]]; then
+    echo "[PASS] AF_XDP book state == file replay, zero drops, all $NUM_MESSAGES snapshots published and consumed"
+fi
+exit "$FAILED"

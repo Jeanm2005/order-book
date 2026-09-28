@@ -15,8 +15,11 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer")
 set(CMAKE_EXE_LINKER_FLAGS_DEBUG "${CMAKE_EXE_LINKER_FLAGS_DEBUG} -fsanitize=address,undefined")
 
+find_package(Threads REQUIRED)
+
 add_library(order_book_engine INTERFACE)
 target_include_directories(order_book_engine INTERFACE include)
+target_link_libraries(order_book_engine INTERFACE Threads::Threads)
 
 add_executable(order_book_main src/main.cpp)
 target_link_libraries(order_book_main PRIVATE order_book_engine)
@@ -95,6 +98,10 @@ add_executable(book_guard_tests tests/book_guard_tests.cpp)
 target_link_libraries(book_guard_tests PRIVATE order_book_engine)
 add_test(NAME book_guard_tests COMMAND book_guard_tests)
 
+add_executable(publisher_tests tests/publisher_tests.cpp)
+target_link_libraries(publisher_tests PRIVATE order_book_engine)
+add_test(NAME publisher_tests COMMAND publisher_tests)
+
 # Phase 4 latency benchmark. Not a test: builds in every config (so CI keeps
 # it compiling), but only a Release run on the dev box produces numbers —
 # see AGENTS.md "Testing before any latency claim". Includes tests/ for the
@@ -105,4 +112,4 @@ target_include_directories(order_book_bench PRIVATE tests)
 
 # A matching-loop bug tends to hang rather than fail (e.g. a stale best
 # level that never empties) — bound every suite so CI fails instead of stalling.
-set_tests_properties(order_book_tests feed_replay_tests signal_tests ladder_tests histogram_tests order_id_map_tests no_alloc_tests book_guard_tests PROPERTIES TIMEOUT 120)
+set_tests_properties(order_book_tests feed_replay_tests signal_tests ladder_tests histogram_tests order_id_map_tests no_alloc_tests book_guard_tests publisher_tests PROPERTIES TIMEOUT 120)
