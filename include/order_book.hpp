@@ -23,7 +23,7 @@ struct LevelQty {
 // Default hot-range width per side, in ticks. 1024 levels x 32-byte
 // PriceLevel = 32 KB per side: the whole hot range of both sides fits in L2
 // alongside the order pool's hot slots. Anything further than ~512 ticks
-// from top of book falls back to the map tail (see level_ladder.hpp).
+// from top of book falls back to the sorted-array tail (see level_ladder.hpp).
 inline constexpr std::size_t kDefaultLadderWindow = 1024;
 
 template <std::size_t PoolCapacity = 1 << 16, std::size_t WindowSize = kDefaultLadderWindow>
@@ -166,8 +166,10 @@ private:
         return n;
     }
 
-    LevelLadder<true, WindowSize>  bids_; // best = highest price
-    LevelLadder<false, WindowSize> asks_; // best = lowest price
+    // Tail capacity == pool capacity: a side can't have more levels than
+    // resting orders, so the preallocated tail can never overflow.
+    LevelLadder<true, WindowSize, PoolCapacity>  bids_; // best = highest price
+    LevelLadder<false, WindowSize, PoolCapacity> asks_; // best = lowest price
 
     MemoryPool<Order, PoolCapacity> pool_;
     OrderIdMap<id_map_capacity()> id_map_;
