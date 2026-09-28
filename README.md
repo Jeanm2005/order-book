@@ -64,7 +64,7 @@ NIC -> XDP/eBPF (kernel) -> AF_XDP zero-copy ring -> userspace poller
 | `include/order.hpp` | `Order` — the order record, cache-line aligned |
 | `include/price_level.hpp` | `PriceLevel` — intrusive FIFO queue of orders resting at one price |
 | `include/memory_pool.hpp` | `MemoryPool` — fixed-capacity slab allocator for `Order` |
-| `include/order_id_map.hpp` | `OrderIdMap` — fixed-capacity `OrderId -> Order*` index backing cancels |
+| `include/order_id_map.hpp` | `OrderIdMap` — fixed-capacity `OrderId -> Order*` index backing cancels (linear probing, backward-shift deletion) |
 | `include/order_book.hpp` | `OrderBook` — the matching engine, price-time priority |
 | `include/spsc_ring_buffer.hpp` | `SpscRingBuffer` — lock-free single-producer/consumer ring for the market-data publish path |
 | `include/feed_message.hpp`, `include/feed_replay.hpp` | synthetic feed wire format + replay engine |
@@ -270,7 +270,7 @@ ctest --test-dir build-debug --output-on-failure
 Debug builds run under ASan/UBSan. The suite covers quantity
 conservation, price-time priority, no phantom/over-fills, replay
 determinism, matching-engine side symmetry, signal correctness,
-ladder-vs-map equivalence, and latency-histogram accuracy, via randomized property tests plus a few targeted regression
+ladder-vs-map equivalence, order-id map probe bounds under long churn, and latency-histogram accuracy, via randomized property tests plus a few targeted regression
 tests. Never benchmark a Debug build — only Release numbers mean anything
 for latency.
 
