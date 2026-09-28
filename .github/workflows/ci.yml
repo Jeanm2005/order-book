@@ -1,9 +1,12 @@
 name: CI
 
-# Phase 0/1 scope only: pure userspace order book + matching engine +
-# replay, no networking. AF_XDP/eBPF work (Phase 2) needs root/CAP_NET_ADMIN
-# and a real NIC/loopback path and cannot run in a hosted runner — see
-# AGENTS.md and README.md roadmap.
+# Userspace matrix (Debug with ASan/UBSan, Release) on every change, plus
+# two jobs for what that matrix can't see:
+#   - af-xdp: builds with -DENABLE_AF_XDP=ON (eBPF object included) and runs
+#     the privileged veth loopback test under sudo. A hosted runner is a
+#     real Linux VM, so generic-mode XDP over veth works there; it is still
+#     not the WSL2 dev box, see AGENTS.md "AF_XDP / eBPF work".
+#   - tsan: the market-data SPSC path under ThreadSanitizer.
 
 on:
   push:
@@ -34,3 +37,45 @@ jobs:
       - name: Test
         working-directory: build
         run: ctest --output-on-failure
+
+  af-xdp:
+    name: AF_XDP build + loopback (sudo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libbpf, socat
+        run: sudo apt-get update && sudo apt-get install -y libbpf-dev socat
+
+      - name: Configure
+        run: >
+          cmake -B build-xdp
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_AF_XDP=ON
+          -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build-xdp -j
+
+      - name: Unit tests
+        working-directory: build-xdp
+        run: ctest --output-on-failure
+
+      - name: Loopback (AF_XDP vs file replay)
+        run: sudo BUILD_DIR=build-xdp ./scripts/xdp_loopback_test.sh
+
+  tsan:
+    name: ThreadSanitizer (publisher)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # TSan's shadow-memory layout breaks under the runner kernel's
+      # default 32-bit mmap ASLR entropy ("unexpected memory mapping").
+      - name: Reduce ASLR entropy for TSan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
+      - name: Build and run publisher_tests under TSan
+        run: |
+          clang++ -std=c++20 -O1 -g -fsanitize=thread -Iinclude tests/publisher_tests.cpp -o publisher_tests_tsan
+          ./publisher_tests_tsan
