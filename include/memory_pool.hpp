@@ -17,7 +17,8 @@ class MemoryPool {
 
         template <typename... Args>
         T* allocate(Args&&... args) {
-            assert(!free_list_.empty() && "Memory pool exhausted");
+            // Exhaustion is a runtime condition the caller handles and
+            // counts (OrderBook::stats()), not a programming error.
             if (free_list_.empty()) {
                 return nullptr;
             }

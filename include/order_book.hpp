@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include "order.hpp"
 #include "price_level.hpp"
 #include "level_ladder.hpp"
@@ -12,6 +13,12 @@ struct Fill {
     OrderId  incoming_id;
     Price    price;   // trade prints at the resting order's price (price-time priority)
     Quantity qty;
+};
+
+// Orders the book refused. Neither case touches book state or emits fills.
+struct BookStats {
+    std::uint64_t pool_exhausted = 0; // no free Order slot: every slot is resting
+    std::uint64_t duplicate_id = 0;   // id already belongs to a resting order
 };
 
 // One aggregated price level as seen from outside the book (L2 view).
@@ -33,9 +40,21 @@ public:
 
     explicit OrderBook(FillHandler on_fill) : on_fill_(on_fill) {}
 
-    void add_order(OrderId id, Side side, Price price, Quantity qty, Nanos ts) {
+    // Returns false, and changes nothing, if the order is refused (see
+    // BookStats). A duplicate id is rejected before matching, as an
+    // exchange would: letting it trade and then rest would leave two
+    // resting orders that a cancel can't tell apart. An id may be reused
+    // once its earlier order has filled or been canceled.
+    bool add_order(OrderId id, Side side, Price price, Quantity qty, Nanos ts) {
+        if (id_map_.find(id)) {
+            ++stats_.duplicate_id;
+            return false;
+        }
         Order* o = pool_.allocate(Order{id, side, price, qty, ts, nullptr, nullptr});
-        if (!o) return; // pool exhausted — counted as a hard error upstream, never thrown here
+        if (!o) {
+            ++stats_.pool_exhausted;
+            return false;
+        }
 
         match(o);
         if (o->quantity > 0) {
@@ -49,7 +68,10 @@ public:
         } else {
             pool_.release(o);
         }
+        return true;
     }
+
+    const BookStats& stats() const { return stats_; }
 
     // Cancels a resting order by id. Returns false if the id is unknown
     // (already filled, already canceled, or never existed).
@@ -174,4 +196,5 @@ private:
     MemoryPool<Order, PoolCapacity> pool_;
     OrderIdMap<id_map_capacity()> id_map_;
     FillHandler on_fill_;
+    BookStats stats_;
 };
