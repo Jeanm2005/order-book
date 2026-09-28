@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include "order.hpp"
 #include "price_level.hpp"
 #include "level_ladder.hpp"
@@ -14,6 +15,12 @@ struct Fill {
     Quantity qty;
 };
 
+// Orders the book refused. Neither case touches book state or emits fills.
+struct BookStats {
+    std::uint64_t pool_exhausted = 0; // no free Order slot: every slot is resting
+    std::uint64_t duplicate_id = 0;   // id already belongs to a resting order
+};
+
 // One aggregated price level as seen from outside the book (L2 view).
 struct LevelQty {
     Price    price;
@@ -23,7 +30,7 @@ struct LevelQty {
 // Default hot-range width per side, in ticks. 1024 levels x 32-byte
 // PriceLevel = 32 KB per side: the whole hot range of both sides fits in L2
 // alongside the order pool's hot slots. Anything further than ~512 ticks
-// from top of book falls back to the map tail (see level_ladder.hpp).
+// from top of book falls back to the sorted-array tail (see level_ladder.hpp).
 inline constexpr std::size_t kDefaultLadderWindow = 1024;
 
 template <std::size_t PoolCapacity = 1 << 16, std::size_t WindowSize = kDefaultLadderWindow>
@@ -33,9 +40,21 @@ public:
 
     explicit OrderBook(FillHandler on_fill) : on_fill_(on_fill) {}
 
-    void add_order(OrderId id, Side side, Price price, Quantity qty, Nanos ts) {
+    // Returns false, and changes nothing, if the order is refused (see
+    // BookStats). A duplicate id is rejected before matching, as an
+    // exchange would: letting it trade and then rest would leave two
+    // resting orders that a cancel can't tell apart. An id may be reused
+    // once its earlier order has filled or been canceled.
+    bool add_order(OrderId id, Side side, Price price, Quantity qty, Nanos ts) {
+        if (id_map_.find(id)) {
+            ++stats_.duplicate_id;
+            return false;
+        }
         Order* o = pool_.allocate(Order{id, side, price, qty, ts, nullptr, nullptr});
-        if (!o) return; // pool exhausted — counted as a hard error upstream, never thrown here
+        if (!o) {
+            ++stats_.pool_exhausted;
+            return false;
+        }
 
         match(o);
         if (o->quantity > 0) {
@@ -49,7 +68,10 @@ public:
         } else {
             pool_.release(o);
         }
+        return true;
     }
+
+    const BookStats& stats() const { return stats_; }
 
     // Cancels a resting order by id. Returns false if the id is unknown
     // (already filled, already canceled, or never existed).
@@ -166,10 +188,13 @@ private:
         return n;
     }
 
-    LevelLadder<true, WindowSize>  bids_; // best = highest price
-    LevelLadder<false, WindowSize> asks_; // best = lowest price
+    // Tail capacity == pool capacity: a side can't have more levels than
+    // resting orders, so the preallocated tail can never overflow.
+    LevelLadder<true, WindowSize, PoolCapacity>  bids_; // best = highest price
+    LevelLadder<false, WindowSize, PoolCapacity> asks_; // best = lowest price
 
     MemoryPool<Order, PoolCapacity> pool_;
     OrderIdMap<id_map_capacity()> id_map_;
     FillHandler on_fill_;
+    BookStats stats_;
 };

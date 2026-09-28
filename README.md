@@ -7,16 +7,28 @@ matter here are correctness and measured latency, not feature breadth.
 
 [![CI](https://github.com/Jeanm2005/order-book/actions/workflows/ci.yml/badge.svg)](https://github.com/Jeanm2005/order-book/actions/workflows/ci.yml)
 
-**Status:** Phase 0 (correctness), Phase 1 (synthetic feed + replay),
-Phase 2 (AF_XDP ingestion), and Phase 3 (signal layer) are done. Phase 2 is opt-in (`-DENABLE_AF_XDP=ON`,
-default off — CI stays on Phase 0/1) and has been verified under real
-privileges on the WSL2 dev box: `scripts/xdp_loopback_test.sh` delivers a
-2000-message synthetic feed over a veth pair through a real `bind()`ed
-AF_XDP socket and produces an identical book state (fills, traded qty,
-best bid/ask, resting qty) to file-replay, with zero kernel-reported drops.
-Phase 4 (flat-array price levels + latency measurement) is done: book +
-signals run at 97 ns p50 / 429 ns p99.9 per message on the dev box — see
-[Latency](#latency-phase-4).
+**Status:** All five phases are done. The design writeup is
+[docs/WRITEUP.md](docs/WRITEUP.md).
+- **Phases 0–3:** correctness, synthetic feed + replay, AF_XDP ingestion,
+  signal layer.
+- **Phase 4:** flat-array price levels and latency measurement. Book +
+  signals ran at 97 ns p50 / 429 ns p99.9 per message on the dev box (see
+  [Latency](#latency-phase-4)).
+- **Phase 5:** the writeup, plus hardening:
+  - the hot path is now mechanically checked to never allocate;
+  - the order-id index stays fast over long runs;
+  - duplicate ids and a full pool are refused and counted;
+  - snapshots are published to a consumer thread over the SPSC ring;
+  - the AF_XDP loopback test is a pass/fail check in CI.
+
+The dev-box latency tables predate the Phase 5 hardening and need one
+re-run (`scripts/bench_report.sh`).
+
+AF_XDP stays opt-in (`-DENABLE_AF_XDP=ON`). `scripts/xdp_loopback_test.sh`
+sends a 2000-message synthetic feed over a veth pair through a real
+AF_XDP socket. The resulting book state must match file replay exactly,
+with zero kernel drops. It passed under real privileges on the WSL2 dev
+box and in a cloud Linux VM, and CI runs it under sudo.
 
 ## What it does
 
@@ -32,10 +44,14 @@ A single-process, single-symbol order book that:
 - Computes real-time market-microstructure signals (microprice, order
   book imbalance at depths 1/3/5) on top of the book state, in
   fixed-point integer arithmetic. *(Phase 3 — see [Signals](#signals))*
+- Publishes each signal snapshot to a market-data consumer thread over a
+  lock-free SPSC ring. It never blocks matching: a consumer that falls a
+  full ring behind gets conflated snapshots, and the drops are counted.
 - Measures its own tick-to-trade latency end-to-end via a histogram,
   reporting p50/p99/p99.9/p99.99 — tail latency is what actually gets
   cared about, not the average. *(Phase 4 — `order_book_bench`, see
-  [Latency](#latency-phase-4))*
+  [Latency](#latency-phase-4); `xdp-listen` also reports rx → publish
+  per frame)*
 
 ## Non-goals
 
@@ -65,27 +81,34 @@ NIC -> XDP/eBPF (kernel) -> AF_XDP zero-copy ring -> userspace poller
 | `include/price_level.hpp` | `PriceLevel` — intrusive FIFO queue of orders resting at one price |
 | `include/memory_pool.hpp` | `MemoryPool` — fixed-capacity slab allocator for `Order` |
 | `include/order_id_map.hpp` | `OrderIdMap` — fixed-capacity `OrderId -> Order*` index backing cancels (linear probing, backward-shift deletion) |
-| `include/order_book.hpp` | `OrderBook` — the matching engine, price-time priority |
+| `include/order_book.hpp` | `OrderBook` — the matching engine, price-time priority; refuses duplicate live ids and full-pool adds (`stats()`) |
 | `include/spsc_ring_buffer.hpp` | `SpscRingBuffer` — lock-free single-producer/consumer ring for the market-data publish path |
+| `include/md_publisher.hpp` | `MdPublisher` — publishes `BookSignals` snapshots over the SPSC ring; never blocks, counts drops |
 | `include/feed_message.hpp`, `include/feed_replay.hpp` | synthetic feed wire format + replay engine |
 | `include/signals.hpp` | Phase 3: `BookSignals` + `compute_signals()` — microprice, order book imbalance at multiple depths |
-| `include/level_ladder.hpp` | Phase 4: `LevelLadder` — one side's price levels: flat bitmap-indexed window over the hot range, `std::map` tail |
-| `include/latency_histogram.hpp`, `include/tsc_clock.hpp` | Phase 4: fixed-size HDR-style histogram, fenced/calibrated RDTSC stamps |
+| `include/level_ladder.hpp` | Phase 4: `LevelLadder` — one side's price levels: flat bitmap-indexed window over the hot range, preallocated sorted-array tail (`LevelTail`) |
+| `include/latency_histogram.hpp`, `include/tsc_clock.hpp`, `include/latency_report.hpp` | Phase 4: fixed-size HDR-style histogram, fenced/calibrated RDTSC stamps, shared report printer |
 | `bench/latency_bench.cpp` | Phase 4: `order_book_bench` — per-stage latency histograms over a replayed feed |
 | `tests/support/map_order_book.hpp` | Phase 4: the pre-swap `std::map` book, kept as test oracle and bench baseline |
 | `src/main.cpp` | CLI: generate/replay a synthetic feed, `record-size`, `xdp-listen` (opt-in build) |
 | `ebpf/xdp_redirect.c` | Phase 2: XDP program, redirects the feed's UDP port into an `XSKMAP` |
 | `include/xdp_socket.hpp`, `src/xdp_socket.cpp` | Phase 2: raw AF_XDP socket (UMEM/ring setup, RX poll loop) |
 | `include/xdp_listen_cmd.hpp`, `src/xdp_listen_cmd.cpp` | Phase 2: `xdp-listen` CLI command, wires `XdpSocket` RX frames into `apply_message()` |
-| `scripts/xdp_loopback_test.sh` | Phase 2: veth + socat loopback correctness test (manual, not CI) |
+| `scripts/xdp_loopback_test.sh` | Phase 2: veth + socat loopback test, AF_XDP vs file replay, pass/fail (CI runs it under sudo) |
+| `scripts/bench_report.sh` | Release build + pinned bench run → the Markdown latency tables below |
+| `docs/WRITEUP.md` | Phase 5: design decisions, verification, latency method and results |
 
-The matching path (`order_book.hpp`, `price_level.hpp`, `memory_pool.hpp`,
-`spsc_ring_buffer.hpp`, `xdp_socket.hpp`'s RX poll loop, and
-`signals.hpp`'s `compute_signals()`) runs under
-a few hard constraints: no heap allocation once the pools/rings are sized
-at startup, no virtual dispatch, prices are fixed-point 64-bit ticks —
-never floating point — and every hot struct gets evaluated for 64-byte
-cache-line alignment.
+The matching path (`order_book.hpp`, `price_level.hpp`, `level_ladder.hpp`,
+`memory_pool.hpp`, `order_id_map.hpp`, `spsc_ring_buffer.hpp`,
+`md_publisher.hpp`, `xdp_socket.hpp`'s RX poll loop, and `signals.hpp`'s
+`compute_signals()`) runs under a few hard constraints:
+- no heap allocation once the pools and rings are sized at startup;
+- no virtual dispatch;
+- prices are fixed-point 64-bit ticks, never floating point;
+- every hot struct gets evaluated for 64-byte cache-line alignment.
+
+`tests/no_alloc_tests.cpp` checks the first rule mechanically: it counts
+`operator new` calls across a million messages and requires zero.
 
 ## Design notes
 
@@ -96,15 +119,21 @@ delivery into userspace while the NIC stays under normal kernel control,
 and it extends directly from prior XDP/eBPF work rather than starting a
 new networking stack from scratch.
 
-**Flat hot window, `std::map` tail.** Each side's price levels live in a
-`LevelLadder`: a flat array of 1024 consecutive ticks (32 KB per side)
+**Flat hot window, sorted-array tail.** Each side's price levels live in
+a `LevelLadder`: a flat array of 1024 consecutive ticks (32 KB per side)
 plus an occupancy bitmap, so finding the next best level is a `clz`/`ctz`
 scan over 64-bit words instead of a tree walk. Prices outside the window
-go to a `std::map` tail. The window follows the top of book: an insert
-beyond the window's better edge re-centers it, and levels that fall out
-move to the tail. Inserts on the worse side just join the tail. Each
-price lives in exactly one place. Only the tail and re-centers can
-allocate. Phases 0–3 shipped on a plain `std::map`, and the swap came
+go to a tail. The window follows the top of book: an insert beyond the
+window's better edge re-centers it, and levels that fall out move to the
+tail. Inserts on the worse side just join the tail. Each price lives in
+exactly one place.
+
+The tail started as a `std::map`, which allocated on every tail insert and
+re-center. It is now a sorted array allocated once, sized to the order
+pool. That size can't overflow, because every level holds at least one
+resting order. The best level sits at the back, where new tail levels
+usually land, so inserts shift little. Nothing allocates after
+construction. Phases 0–3 shipped on a plain `std::map`, and the swap came
 later as its own step: the Phase 0–3 test suites passed against the new
 container with the test code unchanged. `tests/ladder_tests.cpp` then
 runs a 64-tick window against the old map book (kept as
@@ -160,7 +189,8 @@ around each pipeline stage:
 |---|---|
 | `add` / `cancel` | `apply_message()`: match + rest, or cancel |
 | `signals` | `compute_signals()` on the updated book |
-| `total` | message in hand → signals out |
+| `publish` | `MdPublisher::publish()` of the snapshot, with a consumer thread draining the ring on another core |
+| `total` | message in hand → snapshot published |
 | `overhead` | two back-to-back stamps: the measurement floor, reported rather than subtracted |
 
 - **Stamps:** fenced RDTSC (`lfence; rdtsc; lfence` to open,
@@ -173,15 +203,21 @@ around each pipeline stage:
   pass then uses a fresh book, so it replays the identical state sequence.
 - **Baseline:** `--book map` runs the pre-swap `std::map` book on the
   same feed as the before/after baseline.
-- **Not measured:** NIC → userspace (AF_XDP RX) and market-data publish.
+- **Not measured here:** NIC → userspace. `xdp-listen` covers that. It
+  reports `rx->pub` per frame, from `poll()` starting the frame's batch
+  to its snapshot being published, and prints it at shutdown of the
+  loopback test.
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
 cmake --build build
 ./build/order_book_main generate wide.feed 400000 42 wide   # ~hundreds of live levels, drifting mid
-./build/order_book_bench wide.feed --cpu 2                  # flat ladder
-./build/order_book_bench wide.feed --cpu 2 --book map       # pre-swap baseline
+./build/order_book_bench wide.feed --cpu 2 --consumer-cpu 3              # flat ladder
+./build/order_book_bench wide.feed --cpu 2 --consumer-cpu 3 --book map   # pre-swap baseline
 ```
+
+Or run `./scripts/bench_report.sh 2 3`, which does all of the above and
+prints the Markdown tables used below.
 
 There are two feed profiles:
 - **`narrow`** (the default): 11 price levels, 95–105. This is the map's
@@ -190,6 +226,15 @@ There are two feed profiles:
   mostly near the touch.
 
 ### Results
+
+> These tables were measured at commit `50ab4a5`, before the Phase 5
+> hardening. That hardening changed four measured stages:
+> - the `OrderIdMap` deletion scheme;
+> - the sorted-array tail;
+> - the duplicate-id check on add;
+> - the new `publish` stage, now part of `total`.
+>
+> Re-run `scripts/bench_report.sh` on the dev box and replace them.
 
 WSL2 dev box, Release, clang++ 21, `-O3 -march=native`, pinned to CPU 2
 (`--cpu 2`, not an isolated core). Feed: `wide`, 400,000 messages,
@@ -267,19 +312,30 @@ cmake --build build-debug
 ctest --test-dir build-debug --output-on-failure
 ```
 
-Debug builds run under ASan/UBSan. The suite covers quantity
-conservation, price-time priority, no phantom/over-fills, replay
-determinism, matching-engine side symmetry, signal correctness,
-ladder-vs-map equivalence, order-id map probe bounds under long churn, and latency-histogram accuracy, via randomized property tests plus a few targeted regression
-tests. Never benchmark a Debug build — only Release numbers mean anything
+Debug builds run under ASan/UBSan. The suite uses randomized property
+tests plus targeted regression tests. It covers:
+- quantity conservation, price-time priority, and no phantom or
+  over-fills;
+- replay determinism and matching-engine side symmetry;
+- signal correctness;
+- ladder-vs-map equivalence;
+- zero allocations on the hot path;
+- order-id map probe bounds under long churn;
+- refusal of duplicate ids and full-pool adds;
+- the publish ring across real threads;
+- latency-histogram accuracy.
+
+CI also runs the publish path under ThreadSanitizer. The full list, and
+why each check exists, is in [docs/WRITEUP.md](docs/WRITEUP.md#3-how-its-verified). Never benchmark a Debug build — only Release numbers mean anything
 for latency.
 
 ## AF_XDP ingestion (Phase 2, opt-in)
 
 Requires `libbpf-dev` and `clang` (for the eBPF object), and, to actually
-run, root/`CAP_NET_ADMIN` plus a real or loopback-capable (veth) NIC path —
-this only works on the WSL2/Linux dev box, not in CI or a sandboxed
-container. See `AGENTS.md` "AF_XDP / eBPF work".
+run, root/`CAP_NET_ADMIN` plus a real or loopback-capable (veth) NIC path.
+It needs a real Linux kernel: the WSL2 dev box, a Linux VM, or CI's hosted
+runner under sudo. It does not work in an unprivileged container. See
+`AGENTS.md` "AF_XDP / eBPF work".
 
 ```bash
 cmake -B build-xdp -DCMAKE_BUILD_TYPE=Release -DENABLE_AF_XDP=ON -DCMAKE_CXX_COMPILER=clang++
@@ -289,10 +345,18 @@ sudo ./scripts/xdp_loopback_test.sh   # veth + socat loopback correctness check
 
 The loopback script generates a feed, replays it via the file path for an
 expected result, then re-delivers the same messages over a veth pair (one
-`FeedMessage` per UDP datagram, via `socat`) into `xdp-listen`, and prints
-both results for comparison. Verified passing under real privileges on the
-WSL2 dev box: identical fills/traded-qty/best-bid/best-ask/resting-qty,
-zero kernel-reported drops (`XDP_STATISTICS`).
+`FeedMessage` per UDP datagram, via `socat`) into `xdp-listen`.
+
+It then decides pass/fail itself, and exits non-zero on any failure:
+- every book-state line (fills, traded qty, best bid/ask, resting qty,
+  refusals, signals) must match file replay exactly;
+- the kernel must report zero drops (`XDP_STATISTICS`);
+- every published market-data snapshot must reach the consumer, and the
+  consumer's last snapshot must match the final book.
+
+It passed under real privileges on the WSL2 dev box, before the automatic
+pass/fail check existed. The current pass/fail version passed in a cloud
+Linux VM (kernel 6.18, root), and CI runs it on every PR.
 
 Two real bugs surfaced only by running this for real, not by compiling it:
 `bind()` returned a bare `EINVAL` until `XDP_UMEM_COMPLETION_RING`/
@@ -319,5 +383,17 @@ detail.
       levels (differential-tested against the map book), per-stage
       HDR-style histograms, pinned Release numbers from the dev box:
       97 ns p50 / 429 ns p99.9 per message, book + signals.
-- [ ] **Phase 5 — writeup.** The latency numbers, the design tradeoffs,
-      and the why behind each decision.
+- [x] **Phase 5 — writeup + hardening.** [docs/WRITEUP.md](docs/WRITEUP.md).
+      Hardening covered:
+      - a zero-allocation hot path, checked by test;
+      - backward-shift `OrderIdMap`;
+      - an allocation-free ladder tail;
+      - refusal of duplicate ids and full-pool adds;
+      - a market-data publisher over the SPSC ring;
+      - `rx->pub` latency in `xdp-listen`;
+      - a pass/fail AF_XDP loopback in CI;
+      - a TSan CI job.
+
+**Open item:** re-run `scripts/bench_report.sh` and the loopback test on
+the dev box, and replace the Phase 4 tables with the new numbers. Past
+that, see the writeup's [next steps](docs/WRITEUP.md#6-next-if-this-continued).

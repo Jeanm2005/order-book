@@ -141,6 +141,9 @@ int run_replay(const std::string& in_path) {
     if (ob.best_ask(ba)) std::printf("best ask: %lld\n", static_cast<long long>(ba));
     else std::printf("best ask: (none)\n");
     std::printf("resting qty: %lld\n", static_cast<long long>(ob.total_resting_qty()));
+    std::printf("rejected: pool_exhausted=%llu duplicate_id=%llu\n",
+                static_cast<unsigned long long>(ob.stats().pool_exhausted),
+                static_cast<unsigned long long>(ob.stats().duplicate_id));
 
     BookSignals signals;
     compute_signals(ob, signals);

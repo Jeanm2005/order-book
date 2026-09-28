@@ -1,14 +1,120 @@
 #pragma once
+#include <algorithm>
 #include <array>
 #include <bit>
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <map>
-#include <type_traits>
+#include <memory>
 #include <utility>
 #include "order.hpp"
 #include "price_level.hpp"
+
+// The long tail of ONE side's price levels: every level outside the
+// ladder's flat window. A sorted, fixed-capacity array, allocated once at
+// construction and never again — no allocation on any path an order takes.
+//
+// Capacity can't be exceeded: every level holds at least one resting order,
+// so a side never has more levels than the order pool has slots. OrderBook
+// passes its pool capacity; an overflow would mean that invariant broke.
+//
+// Stored worst-first, best at the back. New tail levels usually land just
+// outside the window's worse edge, i.e. near the back, so insert/erase
+// shift few elements. Nothing holds a PriceLevel* across a tail insert or
+// erase (orders don't point back to their level), so moving levels is safe.
+//
+// Prices only; the owning ladder decides what goes here.
+template <bool IsBid, std::size_t Capacity, std::size_t ScratchSize>
+class LevelTail {
+public:
+    LevelTail() : buf_(std::make_unique<PriceLevel[]>(Capacity + ScratchSize)) {}
+
+    bool empty() const { return n_ == 0; }
+    std::size_t size() const { return n_; }
+
+    const PriceLevel* best() const { return n_ ? &buf_[n_ - 1] : nullptr; }
+    PriceLevel* best() { return n_ ? &buf_[n_ - 1] : nullptr; }
+
+    PriceLevel* find(Price price) {
+        std::size_t i = lower(price);
+        return (i < n_ && buf_[i].price == price) ? &buf_[i] : nullptr;
+    }
+
+    // Existing level at `price`, or a new empty one.
+    PriceLevel& find_or_insert(Price price) {
+        std::size_t i = lower(price);
+        if (i < n_ && buf_[i].price == price) return buf_[i];
+        assert(n_ < Capacity && "LevelTail full: more levels than resting orders");
+        std::move_backward(&buf_[i], &buf_[n_], &buf_[n_ + 1]);
+        buf_[i] = PriceLevel{price, 0, nullptr, nullptr};
+        ++n_;
+        return buf_[i];
+    }
+
+    void erase(Price price) {
+        std::size_t i = lower(price);
+        if (i < n_ && buf_[i].price == price) {
+            std::move(&buf_[i + 1], &buf_[n_], &buf_[i]);
+            --n_;
+        }
+    }
+
+    // Level at best-first position k (0 == best). Precondition: k < size().
+    const PriceLevel& nth_best(std::size_t k) const { return buf_[n_ - 1 - k]; }
+
+    template <typename F>
+    void for_each(F&& f) const {
+        for (std::size_t i = 0; i < n_; ++i) f(buf_[i]);
+    }
+
+    // Bulk insert for a window recenter: stage up to ScratchSize levels in
+    // any order with stage(), then merge_staged() folds them in with one
+    // O(size + staged) backward merge instead of one shift per level.
+    // Staged prices must not already be in the tail.
+    void stage(const PriceLevel& level) {
+        assert(staged_ < ScratchSize);
+        buf_[Capacity + staged_++] = level;
+    }
+
+    void merge_staged() {
+        if (staged_ == 0) return;
+        assert(n_ + staged_ <= Capacity && "LevelTail full: more levels than resting orders");
+        PriceLevel* s = &buf_[Capacity];
+        std::sort(s, s + staged_, [](const PriceLevel& a, const PriceLevel& b) { return worse(a.price, b.price); });
+        std::size_t i = n_, j = staged_, out = n_ + staged_;
+        while (j > 0) {
+            if (i > 0 && worse(s[j - 1].price, buf_[i - 1].price)) buf_[--out] = buf_[--i];
+            else buf_[--out] = s[--j];
+        }
+        n_ += staged_;
+        staged_ = 0;
+    }
+
+    // Removes every level with price in [lo, hi] (a contiguous run, since
+    // the array is sorted), calling f on each first.
+    template <typename F>
+    void extract_range(Price lo, Price hi, F&& f) {
+        std::size_t first = lower(IsBid ? lo : hi);
+        std::size_t last = first;
+        while (last < n_ && buf_[last].price >= lo && buf_[last].price <= hi) f(buf_[last++]);
+        std::move(&buf_[last], &buf_[n_], &buf_[first]);
+        n_ -= last - first;
+    }
+
+private:
+    static bool worse(Price a, Price b) { return IsBid ? a < b : a > b; }
+
+    // First index whose price is not worse than `price`.
+    std::size_t lower(Price price) const {
+        const PriceLevel* p = std::lower_bound(&buf_[0], &buf_[0] + n_, price,
+            [](const PriceLevel& l, Price x) { return worse(l.price, x); });
+        return static_cast<std::size_t>(p - &buf_[0]);
+    }
+
+    std::unique_ptr<PriceLevel[]> buf_; // [0, Capacity): sorted levels; then ScratchSize staging slots
+    std::size_t n_ = 0;
+    std::size_t staged_ = 0;
+};
 
 // Price levels for ONE side of the book (Phase 4 replacement for the
 // std::map-only placeholder).
@@ -16,7 +122,8 @@
 // Hot range: a flat array of WindowSize consecutive ticks [base_, base_ +
 // WindowSize), plus a bitmap of which slots hold a non-empty level, so
 // "next best level" is a ctz/clz scan over 64-bit words instead of a tree
-// walk. Long tail: anything outside the window lives in a std::map.
+// walk. Long tail: anything outside the window lives in a LevelTail (a
+// preallocated sorted array; originally a std::map).
 //
 // Invariant: a given price lives in exactly one place — the window if it's
 // in [base_, base_ + WindowSize), otherwise the tail. recenter() keeps this
@@ -26,12 +133,12 @@
 // the window on the *better* side (above it for bids, below it for asks),
 // or any insert while the window is empty, re-anchors the window centered
 // on that price. Inserts outside on the *worse* side just go to the tail —
-// that's the long tail the map is for. Only the tail (and a recenter that
-// evicts into it) can allocate; everything in the hot range is flat.
+// that's the long tail. Nothing here allocates after construction: the
+// window is flat and the tail is sized to TailCapacity up front.
 //
 // Prices are assumed to be at least WindowSize ticks away from the int64
 // limits (base_ arithmetic would overflow otherwise).
-template <bool IsBid, std::size_t WindowSize>
+template <bool IsBid, std::size_t WindowSize, std::size_t TailCapacity = std::size_t{1} << 16>
 class LevelLadder {
     static_assert(WindowSize >= 64 && (WindowSize & (WindowSize - 1)) == 0,
                   "WindowSize must be a power of two >= 64 (one bitmap word minimum)");
@@ -43,8 +150,8 @@ public:
     PriceLevel* best() { return const_cast<PriceLevel*>(std::as_const(*this).best()); }
     const PriceLevel* best() const {
         const PriceLevel* w = best_idx_ >= 0 ? &levels_[static_cast<std::size_t>(best_idx_)] : nullptr;
-        if (tail_.empty()) return w;
-        const PriceLevel* t = &tail_.begin()->second;
+        const PriceLevel* t = tail_.best();
+        if (!t) return w;
         if (!w) return t;
         return better(t->price, w->price) ? t : w;
     }
@@ -55,8 +162,7 @@ public:
             std::size_t idx = index_of(price);
             return test_bit(idx) ? &levels_[idx] : nullptr;
         }
-        auto it = tail_.find(price);
-        return it == tail_.end() ? nullptr : &it->second;
+        return tail_.find(price);
     }
 
     // Level at `price`, created empty if it doesn't exist yet. The caller
@@ -78,9 +184,7 @@ public:
             }
             return levels_[idx];
         }
-        auto [it, inserted] = tail_.try_emplace(price);
-        if (inserted) it->second.price = price;
-        return it->second;
+        return tail_.find_or_insert(price);
     }
 
     // Removes a level that has just become empty.
@@ -111,17 +215,17 @@ public:
             }
             return;
         }
-        auto it = tail_.begin();
+        std::size_t t = 0;
         for (std::size_t n = 0; n < max_levels; ++n) {
             bool have_w = idx >= 0;
-            bool have_t = it != tail_.end();
+            bool have_t = t < tail_.size();
             if (!have_w && !have_t) return;
-            if (have_w && (!have_t || better(levels_[static_cast<std::size_t>(idx)].price, it->first))) {
+            if (have_w && (!have_t || better(levels_[static_cast<std::size_t>(idx)].price, tail_.nth_best(t).price))) {
                 f(levels_[static_cast<std::size_t>(idx)]);
                 idx = next_worse(idx);
             } else {
-                f(it->second);
-                ++it;
+                f(tail_.nth_best(t));
+                ++t;
             }
         }
     }
@@ -134,17 +238,16 @@ public:
                 f(levels_[w * 64 + static_cast<std::size_t>(std::countr_zero(word))]);
             }
         }
-        for (const auto& [price, level] : tail_) f(level);
+        tail_.for_each(f);
     }
 
-    // True if `price` currently maps to the flat window rather than the map
+    // True if `price` currently maps to the flat window rather than the
     // tail. Lets tests pin the recenter *policy*, which is a performance
     // property the differential tests can't see (the tail is equally correct).
     bool in_hot_window(Price price) const { return in_window(price); }
 
 private:
     static constexpr std::size_t kWords = WindowSize / 64;
-    using TailCompare = std::conditional_t<IsBid, std::greater<Price>, std::less<Price>>;
 
     static bool better(Price a, Price b) { return IsBid ? a > b : a < b; }
     // Index order == price order, so "better" by index follows the same rule.
@@ -209,12 +312,14 @@ private:
                 std::size_t idx = w * 64 + static_cast<std::size_t>(std::countr_zero(word));
                 Price p = levels_[idx].price;
                 if (p < new_base || p >= new_end) {
-                    tail_.emplace(p, levels_[idx]);
+                    tail_.stage(levels_[idx]);
                     clear_bit(idx);
                     --window_count_;
                 }
             }
         }
+
+        tail_.merge_staged();
 
         // 2. Shift survivors to their new index, in place. Walking in the
         //    direction of the shift means a slot is always vacated before
@@ -239,16 +344,12 @@ private:
         base_ = new_base;
 
         // 3. Pull tail levels that now fall inside the window into it.
-        const Price lo = new_base, hi = new_end - 1;
-        auto first = tail_.lower_bound(IsBid ? hi : lo);
-        auto last = tail_.upper_bound(IsBid ? lo : hi);
-        for (auto it = first; it != last; ++it) {
-            std::size_t idx = index_of(it->first);
-            levels_[idx] = it->second;
+        tail_.extract_range(new_base, new_end - 1, [this](const PriceLevel& level) {
+            std::size_t idx = index_of(level.price);
+            levels_[idx] = level;
             set_bit(idx);
             ++window_count_;
-        }
-        tail_.erase(first, last);
+        });
 
         best_idx_ = best_in_window();
     }
@@ -259,5 +360,5 @@ private:
     std::ptrdiff_t best_idx_ = -1;   // best non-empty window slot, -1 if window empty
     std::array<std::uint64_t, kWords> bits_{};
     std::array<PriceLevel, WindowSize> levels_{};
-    std::map<Price, PriceLevel, TailCompare> tail_;
+    LevelTail<IsBid, TailCapacity, WindowSize> tail_;
 };
